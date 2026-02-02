@@ -1,315 +1,431 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2LMHeadModel
+from transformers import GPT2Model
 
+# =============================================================================
+# Core Module: Sheaf Window Layer (Phase 1 & 2 Engine)
+# =============================================================================
 class SheafWindowLayer(nn.Module):
-    def __init__(self, hidden_dim=768, window_size=64, mlp_hidden=128, alpha=0.1, diffusion_steps=1):
+    def __init__(self, hidden_dim=768, window_size=64, mlp_hidden=128, alpha=0.0, diffusion_steps=1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.window_size = window_size
-        self.alpha = nn.Parameter(torch.tensor(alpha))  # Trainable step size
+        self.alpha = nn.Parameter(torch.tensor(alpha)) # Trainable step size
         self.diffusion_steps = diffusion_steps
         
-        # Positional embeddings for window
-        self.pos_emb = nn.Parameter(torch.randn(window_size, hidden_dim))
+        # Position Embedding for relative positions in the window
+        self.pos_embedding = nn.Embedding(window_size, hidden_dim) 
         
-        # MLP for restriction maps (2*hidden_dim because we concat [h_i, h_j])
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, mlp_hidden),
+        # Restriction Map (Logic Constraint Calculator)
+        self.restriction_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, mlp_hidden), # Input: [x_u, pos_emb]
             nn.ReLU(),
-            nn.Linear(mlp_hidden, hidden_dim)
+            nn.Linear(mlp_hidden, hidden_dim) # Output: Predicted x_v
         )
-    
-    def forward(self, hidden_states, mode='train'):
+        
+        self.history_buffer = [] # For autoregressive inference
+
+    def forward(self, x, mode='train'):
         """
-        Args:
-            hidden_states: (batch, seq_len, hidden_dim)
-            mode: 'train' or 'inference'
-        Returns:
-            refined_states: (batch, seq_len, hidden_dim)
-            diagnostics: dict with energy metrics
+        x: [Batch, SeqLen, Dim] (Train) or [Batch, 1, Dim] (Validation/Inference step)
         """
-        batch_size, seq_len, _ = hidden_states.shape
-        device = hidden_states.device
+        if mode == 'inference':
+            return self._forward_inference(x)
+        else:
+            return self._forward_train(x)
+
+    def _forward_train(self, x):
+        # x: [B, L, D]
+        # Multi-step Diffusion Loop
+        x_curr = x.clone()
         
-        # Add positional embeddings (broadcast across batch)
-        pos_emb_expanded = self.pos_emb[:seq_len].unsqueeze(0)  # (1, seq_len, hidden_dim)
-        x = hidden_states + pos_emb_expanded
+        # We need to track the initial pre-energy and final post-energy
+        first_pre_energy = 0
+        final_post_energy = 0
+        total_update_norm = 0
+        total_cos_sim = 0
         
-        # Initialize diagnostics
-        diagnostics = {}
-        
-        # Compute initial energy (before diffusion)
-        if mode == 'train':
-            pre_energy = self._compute_energy(x)
-            diagnostics['pre_energy'] = pre_energy
-        
-        # Multi-step diffusion
         for step in range(self.diffusion_steps):
-            x = self._diffusion_step(x)
-        
-        # Compute post-diffusion energy
-        if mode == 'train':
-            post_energy = self._compute_energy(x)
-            diagnostics['post_energy'] = post_energy
+            B, L, D = x_curr.size()
+            K = self.window_size
             
-            # Track update magnitude
-            update_norm = torch.norm(x - hidden_states, dim=-1).mean()
-            diagnostics['update_norm'] = update_norm
+            if L < K:
+                return x_curr, {} # Not enough context
             
-            # Cosine similarity between original and refined
-            cos_sim = F.cosine_similarity(hidden_states.flatten(0, 1), x.flatten(0, 1), dim=-1).mean()
-            diagnostics['cos_sim'] = cos_sim
-        
-        return x, diagnostics
-    
-    def _diffusion_step(self, x):
-        """Single diffusion step over the sequence."""
-        batch_size, seq_len, hidden_dim = x.shape
-        device = x.device
-        
-        # For each position, aggregate from window
-        updates = []
-        for i in range(seq_len):
-            # Define window around position i
-            start = max(0, i - self.window_size // 2)
-            end = min(seq_len, i + self.window_size // 2)
+            # 1. Create Windows using unfold
+            x_perm = x_curr.permute(0, 2, 1) # [B, D, L]
+            windows = x_perm.unfold(2, K, 1) # [B, D, NumWindows, K]
+            windows_feat = windows.permute(0, 2, 3, 1) # [B, W, K, D]
             
-            # Get neighbors in window
-            neighbors = x[:, start:end, :]  # (batch, window_len, hidden_dim)
+            context_nodes = windows_feat[:, :, :-1, :] # [B, W, K-1, D]
+            current_node = windows_feat[:, :, -1, :].unsqueeze(2) # [B, W, 1, D]
             
-            # Compute restriction maps for each neighbor
-            h_i = x[:, i:i+1, :].expand(-1, neighbors.size(1), -1)  # (batch, window_len, hidden_dim)
-            concat = torch.cat([h_i, neighbors], dim=-1)  # (batch, window_len, 2*hidden_dim)
+            # 2. Position Embeddings
+            pos_embeds = self.pos_embedding(torch.arange(K-1, device=x.device)).unsqueeze(0).unsqueeze(0)
             
-            # MLP produces edge features
-            edge_features = self.mlp(concat)  # (batch, window_len, hidden_dim)
+            # 3. Compute Restrictions (MLP)
+            mlp_input = torch.cat([context_nodes, pos_embeds.expand(B, windows_feat.size(1), K-1, D)], dim=-1)
+            predictions = self.restriction_mlp(mlp_input)
             
-            # Aggregate (mean pooling)
-            aggregated = edge_features.mean(dim=1, keepdim=True)  # (batch, 1, hidden_dim)
-            updates.append(aggregated)
-        
-        # Stack updates
-        updates = torch.cat(updates, dim=1)  # (batch, seq_len, hidden_dim)
-        
-        # Diffusion update: x_new = x + alpha * (aggregated - x)
-        x_new = x + self.alpha * (updates - x)
-        
-        return x_new
-    
-    def _compute_energy(self, x):
-        """Compute sheaf energy (disagreement between neighbors)."""
-        batch_size, seq_len, hidden_dim = x.shape
-        device = x.device
-        
-        total_energy = 0.0
-        count = 0
-        
-        for i in range(seq_len):
-            start = max(0, i - self.window_size // 2)
-            end = min(seq_len, i + self.window_size // 2)
+            # 4. Compute Disagreement (Delta)
+            deltas = current_node - predictions
+            mean_delta = deltas.mean(dim=2) # [B, W, D]
             
-            neighbors = x[:, start:end, :]
-            h_i = x[:, i:i+1, :].expand(-1, neighbors.size(1), -1)
+            # 5. Update Vector
+            update_vector = - (self.alpha * mean_delta)
             
-            concat = torch.cat([h_i, neighbors], dim=-1)
-            edge_features = self.mlp(concat)
+            # 6. Apply Update (Safe Clone)
+            x_next = x_curr.clone()
+            x_next[:, K-1:, :] = x_curr[:, K-1:, :] + update_vector
             
-            # Energy = ||R_ij(h_i) - h_j||^2
-            energy = torch.norm(edge_features - neighbors, dim=-1).pow(2).sum()
-            total_energy += energy
-            count += neighbors.size(1) * batch_size
+            # --- Diagnostics ---
+            pre_energy = (mean_delta ** 2).sum(dim=-1).mean()
+            up_norm = update_vector.norm(dim=-1).mean()
+            
+            # Stability Check
+            cos_sim = F.cosine_similarity(current_node.squeeze(2), current_node.squeeze(2) + update_vector, dim=-1).mean()
+            
+            if step == 0:
+                first_pre_energy = pre_energy
+                
+            total_update_norm += up_norm
+            total_cos_sim += cos_sim
+            
+            x_curr = x_next
+            
+            # Analytical Post Energy
+            alpha_val = self.alpha.item() if isinstance(self.alpha, torch.Tensor) else self.alpha
+            post_energy = ((1.0 - alpha_val) ** 2) * pre_energy
+            
+            if step == self.diffusion_steps - 1:
+                final_post_energy = post_energy
         
-        return total_energy / count if count > 0 else torch.tensor(0.0, device=device)
+        diagnostics = {
+            "pre_energy": first_pre_energy,
+            "post_energy": final_post_energy,
+            "update_norm": total_update_norm / self.diffusion_steps,
+            "cos_sim": total_cos_sim / self.diffusion_steps
+        }
+        
+        return x_curr, diagnostics
+
+    def _forward_inference(self, x):
+        # x: [Batch, 1, Dim]
+        self.history_buffer.append(x)
+        if len(self.history_buffer) > self.window_size:
+            self.history_buffer.pop(0)
+            
+        curr_len = len(self.history_buffer)
+        if curr_len < 2:
+            return x 
+            
+        window_seq = torch.cat(self.history_buffer, dim=1) # [B, L_curr, D]
+        target = window_seq[:, -1:, :] 
+        context = window_seq[:, :-1, :]
+        
+        pos_ids = torch.arange(curr_len - 1, device=x.device)
+        pos_embeds = self.pos_embedding(pos_ids).unsqueeze(0)
+        
+        mlp_input = torch.cat([context, pos_embeds.expand(x.size(0), -1, -1)], dim=-1)
+        predictions = self.restriction_mlp(mlp_input)
+        
+        deltas = target - predictions
+        mean_delta = deltas.mean(dim=1, keepdim=True)
+        
+        x_updated = x - (self.alpha * mean_delta)
+        return x_updated
 
 
+# =============================================================================
+# Phase 1 Model: Frozen GPT-2 + Output Logic Filter
+# =============================================================================
 class GPT2WithSheafHead(nn.Module):
-    """GPT-2 with Sheaf Layer as post-processing (Phase 1)."""
-    def __init__(self, base_model, hidden_dim=768, window_size=16, mlp_hidden=128, diffusion_steps=1):
+    def __init__(self, frozen_gpt2, hidden_dim=768, freeze=True, diffusion_steps=1):
         super().__init__()
-        self.backbone = base_model
-        self.sheaf_layer = SheafWindowLayer(hidden_dim, window_size, mlp_hidden, diffusion_steps=diffusion_steps)
-        self.lm_head = nn.Linear(hidden_dim, base_model.config.vocab_size, bias=False)
+        self.backbone = frozen_gpt2
+        self.lm_head = None # Assigned externally (shared)
         
-        # Freeze backbone
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-    
-    def forward(self, input_ids, attention_mask=None, mode='train'):
-        # Get hidden states from frozen GPT-2
-        outputs = self.backbone(input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        hidden_states = outputs.hidden_states[-1]  # Last layer
+        if freeze:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        else:
+            for param in self.backbone.parameters():
+                param.requires_grad = True
+            
+        self.sheaf_layer = SheafWindowLayer(hidden_dim=hidden_dim, diffusion_steps=diffusion_steps, alpha=0.1) # Phase 1 default alpha
         
-        # Apply Sheaf refinement
-        refined_states, diagnostics = self.sheaf_layer(hidden_states, mode=mode)
-        
-        # Project to vocabulary
-        logits = self.lm_head(refined_states)
-        
-        return logits, diagnostics
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.backbone(input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        refined_states, diagnostics = self.sheaf_layer(hidden_states, mode='train')
+        return refined_states, diagnostics
 
 
+# =============================================================================
+# Phase 2 Components: Internal Sheaf Adapters
+# =============================================================================
 class SheafAdapterBlock(nn.Module):
-    """Wraps a GPT2Block and injects Sheaf logic adapter."""
-    def __init__(self, original_block, hidden_dim=768, window_size=16, mlp_hidden=128, diffusion_steps=1):
+    def __init__(self, original_block, config, window_size=16, mlp_hidden=128, diffusion_steps=1):
         super().__init__()
         self.block = original_block
-        self.sheaf_adapter = SheafWindowLayer(hidden_dim, window_size, mlp_hidden, diffusion_steps=diffusion_steps)
+        
+        # Initialize Alpha=0.0 for stability in internal layers
+        self.sheaf_adapter = SheafWindowLayer(
+            hidden_dim=config.n_embd,
+            window_size=window_size,
+            mlp_hidden=mlp_hidden,
+            alpha=0.0, 
+            diffusion_steps=diffusion_steps
+        )
         self.latest_diagnostics = {}
-    
+
     def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, 
                 encoder_hidden_states=None, encoder_attention_mask=None, 
                 use_cache=False, output_attentions=False):
         
-        # SDPA Fix: Cast attention_mask to boolean if it's int64
+        # SDPA Compatibility Fix
         if attention_mask is not None and attention_mask.dtype == torch.int64:
             attention_mask = attention_mask.bool()
-        
-        # 1. Execute Original GPT-2 Block
+
         outputs = self.block(
-            x,
-            layer_past=layer_past,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
+            x, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states, encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache, output_attentions=output_attentions,
         )
         
         hidden_states = outputs[0]
-
-        # 2. Apply Sheaf Logic Adapter
+        
+        # Apply Sheaf Logic Adapter
         refined_states, diagnostics = self.sheaf_adapter(hidden_states, mode='train')
         
-        # 3. Tuple Repacking
+        # Tuple Repacking
         new_outputs = (refined_states,) + outputs[1:]
         
-        # Store diagnostics for aggregation
+        # Save diagnostics for main model to collect
         self.latest_diagnostics = diagnostics
         
         return new_outputs
 
-
 class GPT2WithSheafAdapters(nn.Module):
-    """GPT-2 with Sheaf Adapters injected into specific layers (Phase 2)."""
-    def __init__(self, base_model, hidden_dim=768, window_size=16, mlp_hidden=128, 
-                 target_layers=[8, 9, 10, 11], diffusion_steps=1):
+    def __init__(self, frozen_gpt2, hidden_dim=768, window_size=16, mlp_hidden=128, diffusion_steps=1, target_layers=[8, 9, 10, 11]):
         super().__init__()
-        self.backbone = base_model  # GPT2LMHeadModel
-        self.target_layers = target_layers
+        self.config = frozen_gpt2.config
+        self.backbone = frozen_gpt2
+        self.lm_head = frozen_gpt2.lm_head
+        self.target_layers = set(target_layers)
         
-        # Freeze all backbone parameters
+        # 1. Freeze Backbone
         for param in self.backbone.parameters():
             param.requires_grad = False
-        
-        # Inject adapters into target layers
+            
+        # 2. Inject Sheaf Adapters
         for i in target_layers:
             original_block = self.backbone.transformer.h[i]
-            adapter_block = SheafAdapterBlock(original_block, hidden_dim, window_size, mlp_hidden, diffusion_steps)
-            self.backbone.transformer.h[i] = adapter_block
-    
+            self.backbone.transformer.h[i] = SheafAdapterBlock(
+                original_block, self.config, 
+                window_size=window_size, mlp_hidden=mlp_hidden, diffusion_steps=diffusion_steps
+            )
+
     def forward(self, input_ids, attention_mask=None):
-        # Backbone is GPT2LMHeadModel, so it returns CausalLMOutput with logits.
         outputs = self.backbone(input_ids, attention_mask=attention_mask)
         logits = outputs.logits
         
-        # Collect Diagnostics from all adapters
+        # Collect Diagnostics
         aggregated_diagnostics = {}
-        total_pre_energy = 0
-        total_post_energy = 0
-        total_update_norm = 0
-        count = 0
+        total_pre = 0; total_post = 0; total_up = 0; count = 0
         
         for i in self.target_layers:
             block = self.backbone.transformer.h[i]
             if hasattr(block, 'latest_diagnostics'):
                 diag = block.latest_diagnostics
-                # Aggregate (Average)
+                # Safe Tensor Conversion
                 pre = diag.get("pre_energy", 0)
                 post = diag.get("post_energy", 0)
                 up = diag.get("update_norm", 0)
                 
-                total_pre_energy += pre if isinstance(pre, torch.Tensor) else torch.tensor(pre, device=input_ids.device)
-                total_post_energy += post if isinstance(post, torch.Tensor) else torch.tensor(post, device=input_ids.device)
-                total_update_norm += up if isinstance(up, torch.Tensor) else torch.tensor(up, device=input_ids.device)
+                total_pre += pre if isinstance(pre, torch.Tensor) else torch.tensor(pre, device=input_ids.device)
+                total_post += post if isinstance(post, torch.Tensor) else torch.tensor(post, device=input_ids.device)
+                total_up += up if isinstance(up, torch.Tensor) else torch.tensor(up, device=input_ids.device)
                 count += 1
         
         if count > 0:
-            aggregated_diagnostics["pre_energy"] = total_pre_energy / count 
-            aggregated_diagnostics["post_energy"] = total_post_energy / count
-            aggregated_diagnostics["update_norm"] = total_update_norm / count
-            aggregated_diagnostics["cos_sim"] = torch.tensor(0.0, device=input_ids.device)  # Not tracking for internal now
+            aggregated_diagnostics["pre_energy"] = total_pre / count 
+            aggregated_diagnostics["post_energy"] = total_post / count
+            aggregated_diagnostics["update_norm"] = total_up / count
+        else:
+            aggregated_diagnostics["pre_energy"] = torch.tensor(0.0, device=input_ids.device)
             
         return logits, aggregated_diagnostics
 
 
+# =============================================================================
+# Baseline: Linear Adapter (Simple Control Group)
+# =============================================================================
 class LinearAdapterBlock(nn.Module):
-    """Wraps a GPT2Block and applies a simple linear adapter."""
-    def __init__(self, original_block, hidden_dim=768):
+    def __init__(self, original_block, config):
         super().__init__()
         self.block = original_block
-        # Simple linear transformation with near-identity initialization
-        self.adapter = nn.Linear(hidden_dim, hidden_dim)
-        # Initialize to near-identity
-        nn.init.eye_(self.adapter.weight)
-        nn.init.zeros_(self.adapter.bias)
-        self.adapter.weight.data *= 0.01  # Small perturbation
+        self.adapter = nn.Linear(config.n_embd, config.n_embd)
         
-    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None,
-                encoder_hidden_states=None, encoder_attention_mask=None,
+        # Near-identity initialization
+        nn.init.normal_(self.adapter.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.adapter.bias)
+
+    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, 
+                encoder_hidden_states=None, encoder_attention_mask=None, 
                 use_cache=False, output_attentions=False):
         
-        # SDPA Fix: Cast attention_mask to boolean if it's int64
         if attention_mask is not None and attention_mask.dtype == torch.int64:
             attention_mask = attention_mask.bool()
-        
-        # 1. Execute Original GPT-2 Block
+
         outputs = self.block(
-            x,
-            layer_past=layer_past,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
+            x, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states, encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache, output_attentions=output_attentions,
         )
-        
         hidden_states = outputs[0]
-        
-        # 2. Apply Linear Adapter with residual
+
+        # Apply Linear Adapter (Point-wise)
         adapted = self.adapter(hidden_states)
         refined_states = hidden_states + adapted
         
-        # 3. Tuple Repacking
         new_outputs = (refined_states,) + outputs[1:]
-        
         return new_outputs
 
-
 class GPT2WithLinearAdapters(nn.Module):
-    """GPT-2 with Linear Adapters injected into specific layers (Baseline)."""
-    def __init__(self, base_model, hidden_dim=768, target_layers=[8, 9, 10, 11]):
+    def __init__(self, frozen_gpt2, target_layers=[8, 9, 10, 11]):
         super().__init__()
-        self.backbone = base_model  # GPT2LMHeadModel
-        self.target_layers = target_layers
+        self.config = frozen_gpt2.config
+        self.backbone = frozen_gpt2
+        self.lm_head = frozen_gpt2.lm_head
+        self.target_layers = set(target_layers)
         
-        # Freeze all backbone parameters
         for param in self.backbone.parameters():
             param.requires_grad = False
-        
-        # Inject linear adapters into target layers
+            
         for i in target_layers:
             original_block = self.backbone.transformer.h[i]
-            adapter_block = LinearAdapterBlock(original_block, hidden_dim)
-            self.backbone.transformer.h[i] = adapter_block
-    
+            self.backbone.transformer.h[i] = LinearAdapterBlock(original_block, self.config)
+
     def forward(self, input_ids, attention_mask=None):
-        # Backbone is GPT2LMHeadModel
         outputs = self.backbone(input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
+        return outputs.logits, {}
+
+class RecurrentSheafLayer(nn.Module):
+    """
+    Phase 3 Fixed: Diagonal Gated Sheaf (DGS)
+    Stable SSM-like structure with Logic Error Correction.
+    Memory Complexity: O(D), Time Complexity: O(L)
+    """
+    def __init__(self, hidden_dim=768):
+        super().__init__()
+        self.hidden_dim = hidden_dim
         
-        # Return empty diagnostics for compatibility
-        return logits, {}
+        # 1. Decay Factor (Forget Gate)
+        # Learnable decay initialized close to 1 (long memory) but < 1 (stability)
+        self.decay = nn.Parameter(torch.ones(hidden_dim) * 0.9)
+        
+        # 2. Logic Projector (Restriction Map)
+        # S_prev를 보고 현재 x가 어떠해야 하는지 예측
+        self.restriction = nn.Linear(hidden_dim, hidden_dim)
+        
+        # 3. Input/Update Gate
+        # 얼마나 수정할지 결정 (Kalman Gain 역할)
+        self.update_gate = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Normalization for stability
+        self.ln = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        # x: [Batch, SeqLen, Dim]
+        B, L, D = x.size()
+        
+        # Initial State h_0 = 0
+        h = torch.zeros(B, D, device=x.device)
+        outputs = []
+        
+        # Sigmoid applied to gates ensures stability (0~1)
+        decay_factor = torch.sigmoid(self.decay) 
+        
+        # Recurrent Loop (Diagonal/Element-wise)
+        # This is fast enough in Python for B=8, L=128. 
+        # (Ideally written in CUDA/Triton for production)
+        for t in range(L):
+            x_t = x[:, t, :] # [B, D]
+            
+            # 1. Prediction: "과거 문맥 h가 보기에 x_t는 이래야 한다"
+            pred_x = self.restriction(h)
+            
+            # 2. Logical Error: "실제 x_t와의 불일치"
+            error = x_t - pred_x
+            
+            # 3. Gated Update
+            # z_t: 얼마나 반영할지 결정하는 게이트
+            z_t = torch.sigmoid(self.update_gate(x_t))
+            
+            # 4. State Transition (SSM Style)
+            # h_new = decay * h_old + (1-decay) * gate * error
+            # This convex combination guarantees stability.
+            h = decay_factor * h + (1 - decay_factor) * (z_t * error)
+            
+            outputs.append(h)
+            
+        # Stack & Project
+        y = torch.stack(outputs, dim=1) # [B, L, D]
+        y = self.ln(y) # Final LayerNorm for safety
+        
+        return self.out_proj(y)
+
+class RecurrentSheafBlock(nn.Module):
+    def __init__(self, original_block, config):
+        super().__init__()
+        self.block = original_block
+        # [수정] alpha 인자 제거 (Diagonal Gated Sheaf는 alpha를 쓰지 않음)
+        self.engine = RecurrentSheafLayer(hidden_dim=config.n_embd)
+
+    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, 
+                encoder_hidden_states=None, encoder_attention_mask=None, 
+                use_cache=False, output_attentions=False):
+        
+        # SDPA Compatibility Fix
+        if attention_mask is not None and attention_mask.dtype == torch.int64:
+            attention_mask = attention_mask.bool()
+
+        # 1. Original Block
+        outputs = self.block(
+            x, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states, encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache, output_attentions=output_attentions,
+        )
+        hidden_states = outputs[0]
+
+        # 2. Apply Recurrent Sheaf Engine (Residual Add)
+        correction = self.engine(hidden_states)
+        refined_states = hidden_states + correction
+        
+        new_outputs = (refined_states,) + outputs[1:]
+        return new_outputs
+
+class GPT2WithRecurrentSheaf(nn.Module):
+    def __init__(self, frozen_gpt2, target_layers=[8, 9, 10, 11]):
+        super().__init__()
+        self.config = frozen_gpt2.config
+        self.backbone = frozen_gpt2
+        self.lm_head = frozen_gpt2.lm_head
+        self.target_layers = set(target_layers)
+        
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+            
+        for i in target_layers:
+            original_block = self.backbone.transformer.h[i]
+            self.backbone.transformer.h[i] = RecurrentSheafBlock(original_block, self.config)
+
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.backbone(input_ids, attention_mask=attention_mask)
+        # Recurrent layer doesn't return diagnostics in this simple ver.
+        # But we can add energy logging if needed.
+        return outputs.logits, {}

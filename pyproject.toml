@@ -9,6 +9,9 @@ dependencies = [
     "transformers>=4.36.0",
 ]
 
+[tool.setuptools]
+py-modules = ["models", "train", "data_loader", "linear_adapter"]
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
