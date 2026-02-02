@@ -7,10 +7,11 @@ dependencies = [
     "torch>=2.1.2",
     "torchvision>=0.16.2",
     "transformers>=4.36.0",
+    "datasets>=2.14.0",
 ]
 
 [tool.setuptools]
-py-modules = ["models", "train", "data_loader", "linear_adapter"]
+py-modules = ["models", "train", "data_loader", "linear_adapter", "model_v2", "train_v2", "proofwriter_loader"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
