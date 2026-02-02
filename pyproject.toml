@@ -1,0 +1,14 @@
+[project]
+name = "logicalllm"
+version = "0.1.0"
+description = "Logical reasoning with LLMs using sheaf diffusion"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.1.2",
+    "torchvision>=0.16.2",
+    "transformers>=4.36.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
