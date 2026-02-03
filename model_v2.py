@@ -84,92 +84,183 @@ class RecurrentSheafLayer(nn.Module):
     def forward(self, x):
         # x: [Batch, SeqLen, Dim]
         B, L, D = x.size()
-        
+
         # Initial State h_0 = 0
         h = torch.zeros(B, D, device=x.device)
         outputs = []
-        
-        decay_factor = torch.sigmoid(self.decay) 
-        
+
+        # [Diagnostics Containers]
+        total_energy = torch.tensor(0.0, device=x.device)
+        total_gate = torch.tensor(0.0, device=x.device)
+
+        decay_factor = torch.sigmoid(self.decay)
+
         # Recurrent Loop (O(L))
         for t in range(L):
             x_t = x[:, t, :] # [B, D]
-            
+
             # Prediction
             pred_x = self.restriction(h)
-            
-            # Logical Error (Innovation)
-            error = x_t - pred_x
-            
+
+            # [Metric 1] Logical Inconsistency Energy (Pre-update)
+            # Measures "surprise" - how unexpected is x_t given past context h
+            raw_error = x_t - pred_x
+            energy = raw_error.norm(p=2, dim=-1).mean()  # L2 norm averaged over batch
+            total_energy += energy
+
+            # Stabilized Error for Update (using tanh for numerical stability)
+            error = torch.tanh(raw_error)
+
             # Gating
             z_t = torch.sigmoid(self.update_gate(x_t))
-            
+
+            # [Metric 3] Gate Sparsity (Information Filtering Strength)
+            # Measures how selective the model is in accepting new information
+            total_gate += z_t.mean()
+
             # State Update (Convex Combination)
             # DGS Update Rule
             h = decay_factor * h + (1 - decay_factor) * (z_t * error)
-            
+
             outputs.append(h)
-            
+
         y = torch.stack(outputs, dim=1) # [B, L, D]
         y = self.ln(y)
-        
-        return self.out_proj(y)
+
+        # [Metric 2] Restriction Non-Triviality (Transformation Complexity)
+        # Measures how different the restriction map is from identity (simple copy)
+        w_rho = self.restriction.weight  # [D, D]
+        identity = torch.eye(self.hidden_dim, device=x.device)
+        rho_complexity = torch.norm(w_rho - identity, p='fro')
+
+        diagnostics = {
+            "avg_energy": (total_energy / L).item(),      # Lower = Better prediction
+            "avg_gate": (total_gate / L).item(),          # Lower = More selective
+            "rho_complexity": rho_complexity.item(),      # Higher = More non-trivial logic
+        }
+
+        return self.out_proj(y), diagnostics
 
 
 # =============================================================================
-# 2. The Baseline: Simple Delta Rule (EMA)
+# 2. The Baseline: DeltaNet (Schlag et al., 2021)
 # =============================================================================
-class DeltaRuleLayer(nn.Module):
+
+class DeltaNetLayer(nn.Module):
     """
-    Augmented Baseline: Gated Linear RNN (Matched Parameters)
-    Logic: h_t = decay * h_{t-1} + (1-decay) * gate * transform(x_t)
+    DeltaNet: Associative Memory with Delta Rule Updates (Stabilized)
 
-    Improvements for Fair Comparison:
-      - Added 'input_transform' (Matches Sheaf's 'restriction' params)
-      - Added 'update_gate' (Matches Sheaf's 'update_gate' params)
-      - Total Params are now IDENTICAL to RecurrentSheafLayer.
+    Reference: Schlag et al., "Linear Transformers are Secretly Fast Weight Programmers" (2021)
+
+    Mathematical Definition:
+        W_t = decay * W_{t-1} + σ(β_t) * (v_t - v̄_t) ⊗ φ(k_t)
+        where v̄_t = W_{t-1} @ φ(k_t)
+
+    Stabilizations:
+      - Memory decay: Prevents W from exploding in long sequences
+      - Feature normalization: Keeps phi_k bounded
+      - Small beta init: Conservative learning rate
+      - Gradient clipping: Additional safety
+
+    Parameters:
+      - proj_k, proj_v: 2 × (d×d) for key/value projections
+      - beta_gate: d×1 for learning rate (init very small)
+      - decay: learnable memory decay
+      - out_proj: d×d for output
+      Total: ~3M params per layer
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.hidden_dim = hidden_dim
-        
-        # 1. Decay (Same as Sheaf)
-        self.decay = nn.Parameter(torch.ones(hidden_dim) * 0.9)
-        
-        # 2. Input Transform (Matches Sheaf's Restriction Linear)
-        # Sheaf는 h를 변환하지만, Delta는 x를 변환합니다. (단순 정보 가공)
-        self.input_transform = nn.Linear(hidden_dim, hidden_dim)
-        
-        # 3. Input Gate (Matches Sheaf's Gate Linear)
-        self.update_gate = nn.Linear(hidden_dim, hidden_dim)
-        
-        # 4. Out Proj (Same as Sheaf)
+
+        # Query, Key, Value projections (Q for READ, K/V for WRITE)
+        self.proj_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.proj_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.proj_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        # Beta gate (learning rate) - initialize VERY SMALL to prevent explosion
+        self.beta_gate = nn.Linear(hidden_dim, 1)
+        # Initialize beta to produce ~0.01 initial learning rate
+        nn.init.constant_(self.beta_gate.weight, 0.0)
+        nn.init.constant_(self.beta_gate.bias, -4.0)  # sigmoid(-4) ≈ 0.018
+
+        # Memory decay factor (learnable, init close to 1 for long memory)
+        self.decay = nn.Parameter(torch.ones(1) * 0.99)
+
+        # Output projection
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # LayerNorm for stability
         self.ln = nn.LayerNorm(hidden_dim)
+        self.ln_phi = nn.LayerNorm(hidden_dim)  # Normalize feature map
 
     def forward(self, x):
+        """
+        Args:
+            x: [B, L, D] input sequence
+
+        Returns:
+            y: [B, L, D] output sequence
+
+        DeltaNet Operations:
+            1. READ: o_t = W_{t-1} @ φ(q_t)  (retrieve from memory using query)
+            2. WRITE: W_t = decay * W_{t-1} + β * (v_t - W_{t-1} @ φ(k_t)) ⊗ φ(k_t)
+        """
         B, L, D = x.size()
-        h = torch.zeros(B, D, device=x.device)
-        outputs = []
-        
+
+        # Initialize associative memory matrix W ∈ R^{B, D, D}
+        W = torch.zeros(B, D, D, device=x.device, dtype=x.dtype)
+
+        # Memory decay factor (applied each step)
         decay_factor = torch.sigmoid(self.decay)
-        
+
+        # Pre-compute all projections for efficiency
+        q_all = self.proj_q(x)  # [B, L, D] - for READ
+        k_all = self.proj_k(x)  # [B, L, D] - for WRITE (update)
+        v_all = self.proj_v(x)  # [B, L, D] - for WRITE (target)
+
+        # Apply feature map to all queries and keys
+        phi_q_all = self.ln_phi(F.elu(q_all) + 1)  # [B, L, D]
+        phi_k_all = self.ln_phi(F.elu(k_all) + 1)  # [B, L, D]
+
+        outputs = []
+
         for t in range(L):
-            x_t = x[:, t, :]
-            
-            # --- Logic Difference is Here ---
-            # Sheaf: error = x_t - restriction(h)  (State Feedback)
-            # Delta: value = input_transform(x_t)  (Feedforward)
-            
-            value = self.input_transform(x_t)
-            z_t = torch.sigmoid(self.update_gate(x_t))
-            
-            # Update Rule
-            h = decay_factor * h + (1 - decay_factor) * (z_t * value)
-            
-            outputs.append(h)
-            
-        y = torch.stack(outputs, dim=1)
+            # Current timestep projections
+            phi_q = phi_q_all[:, t, :]  # [B, D] - for READ
+            phi_k = phi_k_all[:, t, :]  # [B, D] - for WRITE
+            v_t = v_all[:, t, :]        # [B, D] - for WRITE
+
+            # === READ OPERATION ===
+            # Retrieve information from memory using QUERY
+            # o_t = W_{t-1} @ φ(q_t)
+            retrieved = torch.bmm(W, phi_q.unsqueeze(-1)).squeeze(-1)  # [B, D]
+
+            # === WRITE OPERATION (Delta Rule Update) ===
+
+            # 1. Predict using KEY
+            v_bar = torch.bmm(W, phi_k.unsqueeze(-1)).squeeze(-1)  # [B, D]
+
+            # 2. Compute prediction error
+            error = v_t - v_bar  # [B, D]
+
+            # 3. Compute gated learning rate
+            beta = torch.sigmoid(self.beta_gate(x[:, t, :]))  # [B, 1]
+
+            # 4. Update memory: W_t = decay * W_{t-1} + β * (error ⊗ φ(k))
+            outer_product = torch.bmm(
+                (beta * error).unsqueeze(-1),  # [B, D, 1]
+                phi_k.unsqueeze(1)             # [B, 1, D]
+            )
+
+            W = decay_factor * W + outer_product  # [B, D, D]
+
+            # === OUTPUT ===
+            # Use retrieved content (NOT v_t!)
+            outputs.append(retrieved)
+
+        # Stack and post-process
+        y = torch.stack(outputs, dim=1)  # [B, L, D]
         y = self.ln(y)
         return self.out_proj(y)
 
@@ -183,11 +274,12 @@ class RecurrentSheafBlock(nn.Module):
         super().__init__()
         self.block = original_block
         self.engine = RecurrentSheafLayer(hidden_dim=config.n_embd)
+        self.diagnostics = {}  # Store latest diagnostics
 
-    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, 
-                encoder_hidden_states=None, encoder_attention_mask=None, 
+    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None,
+                encoder_hidden_states=None, encoder_attention_mask=None,
                 use_cache=False, output_attentions=False):
-        
+
         if attention_mask is not None and attention_mask.dtype == torch.int64:
             attention_mask = attention_mask.bool()
 
@@ -198,23 +290,24 @@ class RecurrentSheafBlock(nn.Module):
         )
         hidden_states = outputs[0]
 
-        # Apply Sheaf Engine
-        correction = self.engine(hidden_states)
+        # Apply Sheaf Engine with diagnostics
+        correction, self.diagnostics = self.engine(hidden_states)
         refined_states = hidden_states + correction
-        
+
         return (refined_states,) + outputs[1:]
 
 
-class DeltaRuleBlock(nn.Module):
+class DeltaNetBlock(nn.Module):
     def __init__(self, original_block, config):
         super().__init__()
         self.block = original_block
-        self.engine = DeltaRuleLayer(hidden_dim=config.n_embd)
+        self.engine = DeltaNetLayer(hidden_dim=config.n_embd)
+        self.use_checkpoint = True  # Enable gradient checkpointing by default
 
-    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None, 
-                encoder_hidden_states=None, encoder_attention_mask=None, 
+    def forward(self, x, layer_past=None, attention_mask=None, head_mask=None,
+                encoder_hidden_states=None, encoder_attention_mask=None,
                 use_cache=False, output_attentions=False):
-        
+
         if attention_mask is not None and attention_mask.dtype == torch.int64:
             attention_mask = attention_mask.bool()
 
@@ -225,10 +318,15 @@ class DeltaRuleBlock(nn.Module):
         )
         hidden_states = outputs[0]
 
-        # Apply Delta Rule Engine
-        correction = self.engine(hidden_states)
+        # Apply DeltaNet Engine with gradient checkpointing to save memory
+        if self.training and self.use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            correction = checkpoint(self.engine, hidden_states, use_reentrant=False)
+        else:
+            correction = self.engine(hidden_states)
+
         refined_states = hidden_states + correction
-        
+
         return (refined_states,) + outputs[1:]
 
 
@@ -241,34 +339,54 @@ class GPT2WithRecurrentSheaf(nn.Module):
         self.backbone = frozen_gpt2
         self.lm_head = frozen_gpt2.lm_head
         self.target_layers = set(target_layers)
-        
+
         for param in self.backbone.parameters():
             param.requires_grad = False
-            
+
         for i in target_layers:
             original_block = self.backbone.transformer.h[i]
             self.backbone.transformer.h[i] = RecurrentSheafBlock(original_block, self.config)
 
     def forward(self, input_ids, attention_mask=None):
         outputs = self.backbone(input_ids, attention_mask=attention_mask)
-        # Diagnostics not implemented for recurrent efficiency
-        return outputs.logits, {}
+
+        # Aggregate diagnostics from all Sheaf layers
+        diagnostics = {
+            "avg_energy": 0.0,
+            "avg_gate": 0.0,
+            "rho_complexity": 0.0,
+        }
+
+        num_sheaf_layers = 0
+        for i in self.target_layers:
+            block = self.backbone.transformer.h[i]
+            if isinstance(block, RecurrentSheafBlock) and hasattr(block, 'diagnostics'):
+                for key in diagnostics.keys():
+                    diagnostics[key] += block.diagnostics.get(key, 0.0)
+                num_sheaf_layers += 1
+
+        # Average across all Sheaf layers
+        if num_sheaf_layers > 0:
+            for key in diagnostics.keys():
+                diagnostics[key] /= num_sheaf_layers
+
+        return outputs.logits, diagnostics
 
 
-class GPT2WithDeltaRule(nn.Module):
+class GPT2WithDeltaNet(nn.Module):
     def __init__(self, frozen_gpt2, target_layers=[8, 9, 10, 11]):
         super().__init__()
         self.config = frozen_gpt2.config
         self.backbone = frozen_gpt2
         self.lm_head = frozen_gpt2.lm_head
         self.target_layers = set(target_layers)
-        
+
         for param in self.backbone.parameters():
             param.requires_grad = False
-            
+
         for i in target_layers:
             original_block = self.backbone.transformer.h[i]
-            self.backbone.transformer.h[i] = DeltaRuleBlock(original_block, self.config)
+            self.backbone.transformer.h[i] = DeltaNetBlock(original_block, self.config)
 
     def forward(self, input_ids, attention_mask=None):
         outputs = self.backbone(input_ids, attention_mask=attention_mask)
@@ -289,7 +407,7 @@ def create_model(
     Factory function to create models with proper configuration.
 
     Args:
-        model_type: One of "baseline", "recurrent_sheaf", "delta_rule"
+        model_type: One of "baseline", "recurrent_sheaf", "deltanet"
         base_model_name: HuggingFace model name ("gpt2", "gpt2-medium")
         target_layers: Optional override for target layers
         device: Optional device to place model on
@@ -326,15 +444,15 @@ def create_model(
             model = model.to(device)
         return model, config
 
-    elif model_type == "delta_rule":
-        print(f"Initializing Delta Rule Baseline (target layers: {layers})...")
-        model = GPT2WithDeltaRule(base_model, target_layers=layers)
+    elif model_type == "deltanet":
+        print(f"Initializing DeltaNet (Associative Memory, target layers: {layers})...")
+        model = GPT2WithDeltaNet(base_model, target_layers=layers)
         if device is not None:
             model = model.to(device)
         return model, config
 
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Available: baseline, recurrent_sheaf, delta_rule")
+        raise ValueError(f"Unknown model_type: {model_type}. Available: baseline, recurrent_sheaf, deltanet")
 
 
 def count_trainable_params(model: nn.Module) -> int:
